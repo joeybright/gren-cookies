@@ -1,0 +1,138 @@
+module Cookie.Parser exposing (Pair, parse)
+
+{-| A single forward-pass parser for the `Cookie` request header.
+
+`parse` tokenizes a whole header string into ordered name/value pairs. Values
+are returned raw (still percent-encoded) with surrounding quotes stripped and
+leading/trailing whitespace trimmed.
+
+Quotes are syntax, not value: `"a;b"` reads as `a;b`, so `;`, `,`, `=`, and
+spaces are literal inside quotes. Interior spaces are preserved; only
+leading/trailing whitespace is trimmed. `+` is preserved; decoding runs once.
+
+@docs Pair, parse
+-}
+
+import Array.Builder exposing (Builder)
+import Parser exposing (Parser, Step(..), (|=), (|.))
+
+
+{-| A single cookie name/value pair. `value` is raw: quotes stripped and
+whitespace trimmed, but not yet percent-decoded.
+-}
+type alias Pair =
+    { name : String
+    , value : String
+    }
+
+
+{-| Tokenize a whole `Cookie` header string into ordered pairs. Cannot fail.
+-}
+parse : String -> Array Pair
+parse source =
+    when Parser.run (Parser.loop (Array.Builder.empty 0) pairsStep) source is
+        Ok pairs ->
+            Array.Builder.toArray pairs
+
+        Err _ ->
+            -- Unreachable: every step consumes input or terminates via `end`.
+            []
+
+
+-- Steps
+
+
+{-| Skip separators and collect each parsed pair until the header ends.
+-}
+pairsStep : Builder Pair -> Parser (Step (Builder Pair) (Builder Pair))
+pairsStep pairs =
+    Parser.oneOf
+        [ Parser.end
+            |> Parser.map (\_ -> Done pairs)
+        , Parser.chompIf (\char -> char == ';')
+            |> Parser.map (\_ -> Loop pairs)
+        , Parser.andThen
+            (\maybePair ->
+                when maybePair is
+                    Just one ->
+                        Parser.succeed (Loop (Array.Builder.pushLast one pairs))
+
+                    Nothing ->
+                        Parser.succeed (Loop pairs)
+            )
+            pair
+        ]
+
+
+{-| Read one pair: a name, then either `=value` or a bare name. A blank segment
+(name trims to empty with no `=`) is skipped by returning `Nothing`.
+-}
+pair : Parser (Maybe Pair)
+pair =
+    Parser.andThen
+        (\n ->
+            Parser.oneOf
+                [ Parser.succeed (\v -> Just { name = n, value = v })
+                    |. Parser.chompIf (\char -> char == '=')
+                    |= value
+                , Parser.succeed
+                    (if String.isEmpty n then
+                        Nothing
+
+                     else
+                        Just { name = n, value = "" }
+                    )
+                ]
+        )
+        name
+
+
+{-| The name is everything up to the first `=` or `;`, whitespace-trimmed.
+-}
+name : Parser String
+name =
+    Parser.map String.trim
+        (Parser.getChompedString 
+            (Parser.chompWhile 
+                (\char -> char /= '=' && char /= ';')
+            )
+        )
+
+
+{-| Accumulated value text and whether a quoted segment is open.
+-}
+type alias ValueState =
+    { chunks : Builder String
+    , quoted : Bool
+    }
+
+
+{-| A value, quote-aware: `;` separates only outside quotes; quotes are
+stripped; everything else is kept. The result is whitespace-trimmed.
+-}
+value : Parser String
+value =
+    valueStep
+        |> Parser.loop { chunks = Array.Builder.empty 0, quoted = False }
+        |> Parser.map
+            (\state ->
+                Array.Builder.toArray state.chunks
+                    |> String.join ""
+                    |> String.trim
+            )
+
+
+{-| Read value text until an unquoted separator or the end of the header.
+-}
+valueStep : ValueState -> Parser (Step ValueState ValueState)
+valueStep state =
+    Parser.oneOf
+        [ Parser.chompIf (\char -> char == '"')
+            |> Parser.map (\_ -> Loop { state | quoted = not state.quoted })
+        , Parser.chompIf (\char -> char == ';' && not state.quoted)
+            |> Parser.map (\_ -> Done state)
+        , Parser.end
+            |> Parser.map (\_ -> Done state)
+        , Parser.getChompedString (Parser.chompIf (\_ -> True))
+            |> Parser.map (\chunk -> Loop { state | chunks = Array.Builder.pushLast chunk state.chunks })
+        ]

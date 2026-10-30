@@ -1,0 +1,47 @@
+module Cookie.Encode exposing (Encoder, string, int, bool, encode)
+
+{-| Encode Gren values for cookies.
+
+@docs Encoder
+
+@docs string, int, bool, encode
+-}
+
+
+{-| An opaque encoder that turns a value into unescaped text.
+Use [`string`](#string), [`int`](#int), or [`bool`](#bool). Its constructor is
+private to this module.
+-}
+type Encoder a
+    = Encoder (a -> String)
+
+
+{-| Encode a string.
+-}
+string : Encoder String
+string =
+    Encoder identity
+
+
+{-| Encode an integer.
+-}
+int : Encoder Int
+int =
+    Encoder String.fromInt
+
+
+{-| Encode a boolean as `"true"` or `"false"`.
+-}
+bool : Encoder Bool
+bool =
+    Encoder (\value -> if value then "true" else "false")
+
+
+{-| Run an encoder on a value.
+
+    Cookie.Encode.encode Cookie.Encode.int 42
+    -- "42"
+-}
+encode : Encoder a -> a -> String
+encode (Encoder encoder) value =
+    encoder value

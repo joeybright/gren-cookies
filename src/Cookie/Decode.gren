@@ -1,0 +1,254 @@
+module Cookie.Decode exposing
+    ( Decoder, Value
+    , string, int, bool
+    , field, withDefault, succeed, fail
+    , decodeString, fromRequest
+    , Error(..)
+    )
+
+{-| Decode cookies into Gren values.
+
+@docs Decoder, Value, Error
+
+@docs string, int, bool
+
+@docs field, withDefault, succeed, fail
+
+@docs decodeString, fromRequest
+-}
+
+import Cookie.Parser as Parser
+import Dict
+import HttpServer
+import Url
+
+
+{-| A decoder for a `Cookie` header.
+-}
+type Decoder a
+    = Decoder (Array Parser.Pair -> Result Error a)
+
+
+{-| An opaque decoder for the text of a single cookie into an application
+value. Pass it to [`Cookie.create`](Cookie#create), [`field`](#field), or
+[`withDefault`](#withDefault).
+
+Use [`string`](#string), [`int`](#int), or [`bool`](#bool). Its constructor is
+private to this module.
+-}
+type Value a
+    = Value (String -> Result String a)
+
+
+{-| Decode a `String` value.
+-}
+string : Value String
+string =
+    Value Ok
+
+
+{-| Decode an `Int` value.
+-}
+int : Value Int
+int =
+    Value
+        (\raw ->
+            String.toInt raw
+                |> Result.fromMaybe ("Expected an integer, got: " ++ raw)
+        )
+
+
+{-| Decode `"true"` or `"false"` case-insensitively, and `"1"` or `"0"` as
+`True` or `False`, respectively.
+-}
+bool : Value Bool
+bool =
+    Value
+        (\raw ->
+            when String.toLower raw is
+                "true" ->
+                    Ok True
+
+                "false" ->
+                    Ok False
+
+                "1" ->
+                    Ok True
+
+                "0" ->
+                    Ok False
+
+                _ ->
+                    Err ("Expected true or false (case-insensitive), 1, or 0, got: " ++ raw)
+        )
+
+
+{-| Decode a named cookie and pass the value to the next step.
+
+    visitsDecoder : Decode.Decoder String
+    visitsDecoder =
+        Decode.field "session" Decode.string Decode.succeed
+
+The name is matched case-sensitively against parsed cookie names.
+
+The value of the cookie, before decoding, is percent-decoded.
+Invalid encoding fails with `InvalidEncoding`.
+-}
+field : String -> Value a -> (a -> Decoder b) -> Decoder b
+field name valueDecoder cont =
+    Decoder
+        (\pairs ->
+            decode name valueDecoder pairs
+                |> Result.andThen (\value -> run cont value pairs)
+        )
+
+
+{-| Decode a named cookie, using a default value if it is absent.
+
+    themeDecoder : Decode.Decoder String
+    themeDecoder =
+        Decode.withDefault "theme" Decode.string "light" Decode.succeed
+
+Only an absent cookie uses the default. Duplicate cookies, invalid encoding,
+and rejected values still fail, just as they do with [`field`](#field).
+-}
+withDefault : String -> Value a -> a -> (a -> Decoder b) -> Decoder b
+withDefault name valueDecoder default cont =
+    Decoder
+        (\pairs ->
+            when decode name valueDecoder pairs is
+                Ok value ->
+                    run cont value pairs
+
+                Err (MissingCookie _) ->
+                    run cont default pairs
+
+                Err err ->
+                    Err err
+        )
+
+
+{-| Create a decoder that always succeeds with the given value. Use it to
+finish a chain of [`field`](#field) calls.
+
+    sessionDecoder : Decode.Decoder { token : String, visits : Int }
+    sessionDecoder =
+        Decode.field "session" Decode.string <| \token ->
+        Decode.field "visits" Decode.int <| \visits ->
+            Decode.succeed { token = token, visits = visits }
+
+    Decode.decodeString sessionDecoder "session=abc; visits=42"
+    -- Ok { token = "abc", visits = 42 }
+-}
+succeed : a -> Decoder a
+succeed value =
+    Decoder (\_ -> Ok value)
+
+
+{-| Create a decoder that always fails with `InvalidValue` and the given
+message. This message is used as-is, without a cookie-name prefix.
+Use it to reject a value while chaining [`field`](#field) calls.
+
+    sessionDecoder : Decode.Decoder { token : String, visits : Int }
+    sessionDecoder =
+        Decode.field "session" Decode.string <| \token ->
+        Decode.field "visits" Decode.int <| \visits ->
+            if visits < 0 then
+                Decode.fail "Visit count cannot be negative"
+
+            else
+                Decode.succeed { token = token, visits = visits }
+
+    Decode.decodeString sessionDecoder "session=abc; visits=-1"
+    -- Err (Decode.InvalidValue "Visit count cannot be negative")
+-}
+fail : String -> Decoder a
+fail reason =
+    Decoder (\_ -> Err (InvalidValue reason))
+
+
+{-| Run a decoder on a `Cookie` header value. Pass only the cookie pairs,
+such as `"session=abc; visits=42"`, without the `Cookie:` prefix.
+-}
+decodeString : Decoder a -> String -> Result Error a
+decodeString (Decoder decoder) source =
+    decoder (Parser.parse source)
+
+
+{-| Decode cookies from a [`HttpServer.Request`](https://packages.gren-lang.org/package/gren-lang/node/version/6.2.1/module/HttpServer#Request)
+from `gren-lang/node`.
+
+    Decode.fromRequest sessionDecoder request
+    -- Result Decode.Error { token : String, visits : Int }
+-}
+fromRequest : Decoder a -> HttpServer.Request -> Result Error a
+fromRequest (Decoder decoder) request =
+    request
+        |> .headers
+        |> Dict.foldl
+            (\key header found ->
+                if String.toLower key == "cookie" then
+                    Array.append (Parser.parse header) found
+
+                else
+                    found
+            )
+            []
+        |> decoder
+
+
+{-| Errors that can happen when decoding cookies.
+
+- `MissingCookie name` means the selected cookie is absent.
+- `DuplicateCookie name` means the selected name appears more than once.
+- `InvalidEncoding name` means that cookie's value contains invalid percent
+  escapes or percent-encoded UTF-8.
+- `InvalidValue message` means a value decoder rejected the text, or
+  [`fail`](#fail) was called. A value decoder's message is prefixed with the
+  cookie name, as in `"visits: Expected an integer, got: many"`. A message passed
+  to `fail` has no prefix.
+-}
+type Error
+    = MissingCookie String
+    | DuplicateCookie String
+    | InvalidEncoding String
+    | InvalidValue String
+
+
+{-| Run the next step against the same parsed header pairs.
+-}
+run : (a -> Decoder b) -> a -> Array Parser.Pair -> Result Error b
+run cont value pairs =
+    let
+        (Decoder decoder) =
+            cont value
+    in
+    decoder pairs
+
+
+{-| Find one cookie and percent-decode its value before running the value decoder.
+-}
+decode : String -> Value a -> Array Parser.Pair -> Result Error a
+decode name (Value valueDecoder) pairs =
+    let
+        matches : Array Parser.Pair
+        matches =
+            Array.keepIf (\pair_ -> pair_.name == name) pairs
+    in
+    if Array.length matches > 1 then
+        Err (DuplicateCookie name)
+
+    else
+        when Array.first matches is
+            Nothing ->
+                Err (MissingCookie name)
+
+            Just one ->
+                one.value
+                    |> Url.percentDecode
+                    |> Result.fromMaybe (InvalidEncoding name)
+                    |> Result.andThen
+                        (\raw ->
+                            valueDecoder raw
+                                |> Result.mapError (\message -> InvalidValue (name ++ ": " ++ message))
+                        )

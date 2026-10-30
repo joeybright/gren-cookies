@@ -1,0 +1,293 @@
+module Main exposing (main)
+
+{-| Representative public-contract tests for reading, decoding, and writing cookies.
+-}
+
+import Bytes
+import Cookie
+import Cookie.Decode as Decode
+import Cookie.Encode as Encode
+import Dict
+import Expect
+import HttpServer
+import Test exposing (Test, describe, test)
+import Test.Runner.Node
+import Url
+
+
+{-| Run the 30 public-contract cases.
+-}
+main : Test.Runner.Node.Program
+main =
+    Test.Runner.Node.run <|
+        describe "Cookies"
+            [ fromRequestTests
+            , decodingTests
+            , writingTests
+            ]
+
+
+{-| Header lookup, representative wire syntax, and the four decoding errors.
+-}
+fromRequestTests : Test
+fromRequestTests =
+    let
+        fixtures : Array { label : String, header : String, expected : Result Decode.Error String }
+        fixtures =
+            [ { label = "Trims quoted pairs, matches names exactly, and percent-decodes once"
+              , header = "Session=other; \tsession = \"a+b/c==; 😀%3D%2520\" \t; other=%XY"
+              , expected = Ok "a+b/c==; 😀=%20"
+              }
+            , { label = "Preserves an empty value"
+              , header = "session="
+              , expected = Ok ""
+              }
+            , { label = "Reports a missing cookie rather than matching a different case"
+              , header = "Session=other"
+              , expected = Err (Decode.MissingCookie "session")
+              }
+            , { label = "Rejects malformed percent escapes"
+              , header = "session=%XY"
+              , expected = Err (Decode.InvalidEncoding "session")
+              }
+            , { label = "Rejects invalid percent-encoded UTF-8"
+              , header = "session=%FF"
+              , expected = Err (Decode.InvalidEncoding "session")
+              }
+            ]
+
+        stringTests : Array Test
+        stringTests =
+            Array.map
+                (\fixture ->
+                    test fixture.label <|
+                        \_ ->
+                            exampleRequest (Dict.singleton "cOoKiE" fixture.header)
+                                |> Cookie.fromRequest sessionCookie
+                                |> Expect.equal fixture.expected
+                )
+                fixtures
+    in
+    describe "Reading cookies"
+        [ describe "String values" stringTests
+        , test "Rejects duplicates across header entries before decoding their values" <|
+            \_ ->
+                Dict.empty
+                    |> Dict.set "Cookie" "session=%XY"
+                    |> Dict.set "cookie" "session=valid"
+                    |> exampleRequest
+                    |> Cookie.fromRequest sessionCookie
+                    |> Expect.equal (Err (Decode.DuplicateCookie "session"))
+        , test "Reports a rejected value with the configured cookie name" <|
+            \_ ->
+                exampleRequest (Dict.singleton "Cookie" "visits=bad")
+                    |> Cookie.fromRequest visitsCookie
+                    |> Expect.equal (Err (Decode.InvalidValue "visits: Expected an integer, got: bad"))
+        ]
+
+
+{-| Primitive decoding, composition, defaults, and explicit rejection.
+-}
+decodingTests : Test
+decodingTests =
+    let
+        booleanFixtures : Array { raw : String, expected : Result {} Bool }
+        booleanFixtures =
+            [ { raw = "tRuE", expected = Ok True }
+            , { raw = "fAlSe", expected = Ok False }
+            , { raw = "1", expected = Ok True }
+            , { raw = "0", expected = Ok False }
+            , { raw = "yes", expected = Err {} }
+            ]
+
+        booleanTests : Array Test
+        booleanTests =
+            Array.map
+                (\fixture ->
+                    test ("Decodes or rejects " ++ fixture.raw) <|
+                        \_ ->
+                            Decode.decodeString
+                                (Decode.field "flag" Decode.bool Decode.succeed)
+                                ("flag=" ++ fixture.raw)
+                                |> Result.mapError (\_ -> {})
+                                |> Expect.equal fixture.expected
+                )
+                booleanFixtures
+
+        defaultFixtures : Array { label : String, header : String, expected : Result {} Int }
+        defaultFixtures =
+            [ { label = "Uses a present value", header = "visits=3", expected = Ok 3 }
+            , { label = "Defaults when absent", header = "", expected = Ok 7 }
+            , { label = "Rejects duplicates", header = "visits=1; visits=2", expected = Err {} }
+            , { label = "Rejects invalid values", header = "visits=bad", expected = Err {} }
+            ]
+
+        defaultTests : Array Test
+        defaultTests =
+            Array.map
+                (\fixture ->
+                    test fixture.label <|
+                        \_ ->
+                            Decode.decodeString
+                                (Decode.withDefault "visits" Decode.int 7 Decode.succeed)
+                                fixture.header
+                                |> Result.mapError (\_ -> {})
+                                |> Expect.equal fixture.expected
+                )
+                defaultFixtures
+    in
+    describe "Decoding values"
+        [ describe "Booleans" booleanTests
+        , test "Combines mixed types regardless of header order" <|
+            \_ ->
+                exampleRequest (Dict.singleton "Cookie" "name=joey; enabled=true; visits=3")
+                    |> Decode.fromRequest profileCookieDecoder
+                    |> Expect.equal (Ok { visits = 3, name = "joey", enabled = True })
+        , test "Stops a field chain at the first error" <|
+            \_ ->
+                Decode.decodeString profileCookieDecoder "name=joey"
+                    |> Expect.equal (Err (Decode.MissingCookie "visits"))
+        , describe "Defaults" defaultTests
+        , test "A continuation can reject a value with its own message" <|
+            \_ ->
+                Decode.decodeString
+                    (Decode.field "visits" Decode.int <| \count ->
+                        if count < 0 then
+                            Decode.fail "Visits cannot be negative"
+
+                        else
+                            Decode.succeed count
+                    )
+                    "visits=-1"
+                    |> Expect.equal (Err (Decode.InvalidValue "Visits cannot be negative"))
+        ]
+
+
+{-| Exact wire output for values, configuration, and scoped deletion.
+-}
+writingTests : Test
+writingTests =
+    let
+        booleanFixtures : Array { value : Bool, expected : String }
+        booleanFixtures =
+            [ { value = True, expected = "flag=true; Path=/" }
+            , { value = False, expected = "flag=false; Path=/" }
+            ]
+
+        booleanTests : Array Test
+        booleanTests =
+            Array.map
+                (\fixture ->
+                    test ("Writes " ++ fixture.expected) <|
+                        \_ ->
+                            Cookie.toString
+                                (Cookie.create { name = "flag", encoder = Encode.bool, decoder = Decode.bool })
+                                fixture.value
+                                |> Expect.equal fixture.expected
+                )
+                booleanFixtures
+    in
+    describe "Writing cookies"
+        [ test "Percent-encodes special characters and Unicode with only the default path" <|
+            \_ ->
+                Cookie.toString sessionCookie "a+b/c==; ,:😀%20"
+                    |> Expect.equal "session=a%2Bb%2Fc%3D%3D%3B%20%2C%3A%F0%9F%98%80%2520; Path=/"
+        , test "Truncates cookie names for writing and reading empty values" <|
+            \_ ->
+                let
+                    cookie : Cookie.Cookie Cookie.Insecure String
+                    cookie =
+                        Cookie.create { name = "session; ignored; suffix", encoder = Encode.string, decoder = Decode.string }
+                in
+                { header = Cookie.toString cookie ""
+                , value = Cookie.fromRequest cookie (exampleRequest (Dict.singleton "Cookie" "session="))
+                }
+                    |> Expect.equal { header = "session=; Path=/", value = Ok "" }
+        , test "Writes integers as decimal values" <|
+            \_ ->
+                Cookie.toString visitsCookie 42
+                    |> Expect.equal "visits=42; Path=/"
+        , describe "Boolean encoding" booleanTests
+        , test "Truncates attribute suffixes, normalizes paths, and replaces repeated settings" <|
+            \_ ->
+                sessionCookie
+                    |> Cookie.withDomain ".Example.COM; Max-Age=0"
+                    |> Cookie.withPath "account; SameSite=None"
+                    |> Cookie.withSecure
+                    |> Cookie.withHttpOnly
+                    |> Cookie.withHttpOnly
+                    |> Cookie.withSameSite Cookie.Strict
+                    |> Cookie.withMaxAge 10
+                    |> Cookie.withMaxAge 3600
+                    |> (\cookie -> Cookie.toString cookie "token")
+                    |> Expect.equal "session=token; Domain=.Example.COM; Path=/account; Secure; HttpOnly; SameSite=Strict; Max-Age=3600"
+        , test "Writes SameSite=Lax without Secure" <|
+            \_ ->
+                Cookie.toString (Cookie.withSameSite Cookie.Lax sessionCookie) "x"
+                    |> Expect.equal "session=x; Path=/; SameSite=Lax"
+        , test "Writes SameSite=None with Secure" <|
+            \_ ->
+                Cookie.toString (sessionCookie |> Cookie.withSecure |> Cookie.withSameSiteNone) "x"
+                    |> Expect.equal "session=x; Path=/; Secure; SameSite=None"
+        , test "Clamps negative Max-Age to zero" <|
+            \_ ->
+                Cookie.toString (Cookie.withMaxAge -10 sessionCookie) "x"
+                    |> Expect.equal "session=x; Path=/; Max-Age=0"
+        , test "Replaces an invalid path with root" <|
+            \_ ->
+                Cookie.toString (Cookie.withPath "/bad\npath" sessionCookie) "x"
+                    |> Expect.equal "session=x; Path=/"
+        , test "Clearing bypasses the encoder, preserves scope, and replaces Max-Age" <|
+            \_ ->
+                visitsCookie
+                    |> Cookie.withDomain ".Example.COM"
+                    |> Cookie.withPath "account"
+                    |> Cookie.withSecure
+                    |> Cookie.withHttpOnly
+                    |> Cookie.withSameSiteNone
+                    |> Cookie.withMaxAge 3600
+                    |> Cookie.clearString
+                    |> Expect.equal "visits=; Domain=.Example.COM; Path=/account; Secure; HttpOnly; SameSite=None; Max-Age=0"
+        ]
+
+
+{-| Build a request from headers as supplied by the HTTP adapter.
+-}
+exampleRequest : Dict.Dict String String -> HttpServer.Request
+exampleRequest headers =
+    { headers = headers
+    , method = HttpServer.GET
+    , body = Bytes.fromString ""
+    , url =
+        { protocol = Url.Http
+        , host = "localhost"
+        , port_ = Nothing
+        , path = "/"
+        , query = Nothing
+        , fragment = Nothing
+        }
+    }
+
+
+{-| A string cookie for request parsing and response serialization.
+-}
+sessionCookie : Cookie.Cookie Cookie.Insecure String
+sessionCookie =
+    Cookie.create { name = "session", encoder = Encode.string, decoder = Decode.string }
+
+
+{-| An integer cookie also verifies that clearing bypasses the value encoder.
+-}
+visitsCookie : Cookie.Cookie Cookie.Insecure Int
+visitsCookie =
+    Cookie.create { name = "visits", encoder = Encode.int, decoder = Decode.int }
+
+
+{-| Field composition shares one header and preserves typed values.
+-}
+profileCookieDecoder : Decode.Decoder { visits : Int, name : String, enabled : Bool }
+profileCookieDecoder =
+    Decode.field "visits" Decode.int <| \count ->
+    Decode.field "name" Decode.string <| \name ->
+    Decode.field "enabled" Decode.bool <| \enabled ->
+        Decode.succeed { visits = count, name = name, enabled = enabled }

@@ -1,0 +1,422 @@
+module Cookie exposing
+    ( Cookie, Insecure, Secure
+    , create
+    , withSecure, withHttpOnly
+    , SameSite(..), withSameSite, withSameSiteNone
+    , withPath, withDomain, withMaxAge
+    , fromRequest
+    , set, clear
+    , toString, clearString
+    )
+
+{-| Read, set, and clear cookies in HTTP requests and responses.
+
+@docs Cookie, Insecure, Secure
+
+@docs create
+
+## Configuring cookies
+
+Configuration functions return an updated cookie. Use a pipeline to combine
+them, then keep the resulting cookie in your application settings.
+
+`withSecure` and `withHttpOnly` enable attributes that cannot be turned off.
+The other functions replace their respective settings when called again.
+
+@docs SameSite
+
+@docs withSecure, withHttpOnly
+
+@docs withSameSite, withSameSiteNone
+
+@docs withPath, withDomain, withMaxAge
+
+## Reading cookies
+
+@docs fromRequest
+
+## Setting and clearing cookies
+
+@docs set, clear
+
+## String values
+
+@docs toString, clearString
+-}
+
+import Cookie.Decode as Decode
+import Cookie.Encode as Encode
+import HttpServer
+import HttpServer.Response as Response
+import Url
+
+
+{-| A cookie definition, containing its name, encoder, decoder, and attributes.
+
+The `security` state is either [`Insecure`](#Insecure) or [`Secure`](#Secure).
+The `a` is the type of value the cookie reads and writes. For example,
+`Cookie Secure String` is a cookie with the `Secure` attribute whose value is a
+string.
+-}
+type Cookie security a
+    = Cookie
+        { name : String
+        , encoder : Encode.Encoder a
+        , decoder : Decode.Value a
+        , path : String
+        , domain : Maybe String
+        , secure : Bool
+        , httpOnly : Bool
+        , sameSite : Maybe SameSiteSetting
+        , maxAge : Maybe Int
+        }
+
+
+{-| A cookie without the `Secure` attribute, as returned by [`create`](#create).
+Use [`withSecure`](#withSecure) to produce a `Cookie Secure a`.
+-}
+type Insecure
+    = Insecure
+
+
+{-| A cookie with the `Secure` attribute, produced by [`withSecure`](#withSecure).
+This state allows [`withSameSiteNone`](#withSameSiteNone) to be used.
+-}
+type Secure
+    = Secure
+
+
+{-| Create a cookie with a name and the functions used to encode and decode its
+values.
+
+    visitCookie : Cookie.Cookie Cookie.Insecure Int
+    visitCookie =
+        Cookie.create
+            { name = "visits"
+            , encoder = Cookie.Encode.int
+            , decoder = Cookie.Decode.int
+            }
+
+New cookies use `Path=/`, have no `Domain` attribute (host-only), and have no
+`Max-Age` (a browser-session cookie). `Secure`, `HttpOnly`, and `SameSite` are
+also absent. Use the configuration functions to set those attributes.
+
+If a semicolon is in the given name `String`, it's removed along with all text after it.
+-}
+create : { name : String, encoder : Encode.Encoder a, decoder : Decode.Value a } -> Cookie Insecure a
+create input =
+    Cookie
+        { name = beforeSemicolon input.name
+        , encoder = input.encoder
+        , decoder = input.decoder
+        , path = "/"
+        , domain = Nothing
+        , secure = False
+        , httpOnly = False
+        , sameSite = Nothing
+        , maxAge = Nothing
+        }
+
+
+{-| Turn on the `Secure` attribute, asking the browser to send this cookie only
+over HTTPS.
+
+    visitCookie |> Cookie.withSecure
+    -- Cookie.Cookie Cookie.Secure Int
+
+This changes a `Cookie Insecure a` into a `Cookie Secure a`. Once a cookie is 
+marked as secure, it cannot be marked as insecure again.
+-}
+withSecure : Cookie Insecure a -> Cookie Secure a
+withSecure (Cookie settings) =
+    Cookie { settings | secure = True }
+
+
+{-| Turn on `HttpOnly`, preventing browser JavaScript from reading the cookie
+through `document.cookie`. The browser can still include it in HTTP requests.
+
+    hostSession |> Cookie.withHttpOnly
+
+This attribute is absent by default and cannot be turned off once enabled.
+-}
+withHttpOnly : Cookie security a -> Cookie security a
+withHttpOnly (Cookie settings) =
+    Cookie { settings | httpOnly = True }
+
+
+{-| A SameSite policy for [`withSameSite`](#withSameSite).
+
+Use [`withSameSiteNone`](#withSameSiteNone) for `SameSite=None`; it requires
+`Cookie Secure a`.
+-}
+type SameSite
+    = Strict
+    | Lax
+
+
+{-| Internal settings include the cross-site policy available only to secure cookies.
+-}
+type SameSiteSetting
+    = Restricted SameSite
+    | Unrestricted
+
+
+{-| Set the SameSite policy to `Strict` or `Lax`, replacing any previous policy.
+
+    visitCookie 
+        |> Cookie.withSameSite Cookie.Lax
+
+New cookies have no explicit SameSite policy. Use [`withSameSiteNone`](#withSameSiteNone)
+to set `None`.
+-}
+withSameSite : SameSite -> Cookie security a -> Cookie security a
+withSameSite sameSite (Cookie settings) =
+    Cookie { settings | sameSite = Just (Restricted sameSite) }
+
+
+{-| Set `SameSite=None`, allowing the cookie in cross-site requests subject to
+the browser's other cookie policies.
+
+    visitCookie
+        |> Cookie.withSecure
+        |> Cookie.withSameSiteNone
+
+This function accepts only a `Cookie Secure a`, so `SameSite=None` cannot be
+combined with an insecure cookie. It replaces any previous SameSite policy.
+-}
+withSameSiteNone : Cookie Secure a -> Cookie Secure a
+withSameSiteNone (Cookie settings) =
+    Cookie { settings | sameSite = Just Unrestricted }
+
+
+{-| Set the path the browser uses to decide which requests receive the cookie.
+The default is `/`.
+
+    visitCookie |> Cookie.withPath "/account"
+
+If a semicolon is in the given `String`, it's removed along with all text after it.
+-}
+withPath : String -> Cookie security a -> Cookie security a
+withPath raw (Cookie settings) =
+    let
+        prefix : String
+        prefix =
+            beforeSemicolon raw
+
+        path : String
+        path =
+            if String.startsWith "/" prefix then prefix else "/" ++ prefix
+
+        normalized : String
+        normalized =
+            if String.unitLength path <= 1024 && not (String.endsWith " " path) && String.all (\char -> char >= ' ' && char <= '~') path then
+                path
+
+            else
+                "/"
+    in
+    Cookie { settings | path = normalized }
+
+
+{-| Set a Domain attribute. Without this attribute, the cookie is host-only.
+
+    visitCookie |> Cookie.withDomain ".Example.COM"
+    -- Uses Domain=.Example.COM
+
+If a semicolon is in the given `String`, it's removed along with all text after it.
+-}
+withDomain : String -> Cookie security a -> Cookie security a
+withDomain domain (Cookie settings) =
+    Cookie { settings | domain = Just (beforeSemicolon domain) }
+
+
+{-| Set the cookie's lifetime in whole seconds, replacing any previous Max-Age.
+
+    visitCookie |> Cookie.withMaxAge 3600
+
+New cookies have no Max-Age and last for the browser session. Any negative values
+passed to this function are clamped to 0. If given a Max-Age of 0, the browser 
+expires the cookie immediately. Alternatively, you can use [`clear`](#clear) to 
+empty the cookie value in the browser.
+-}
+withMaxAge : Int -> Cookie security a -> Cookie security a
+withMaxAge seconds (Cookie settings) =
+    Cookie { settings | maxAge = Just (max 0 seconds) }
+
+
+{-| Read a cookie from a request using the name and decoder in its definition.
+
+Accepts an [`HttpServer.Request`](https://packages.gren-lang.org/package/gren-lang/node/version/6.2.1/module/HttpServer#Request)
+from the `gren-lang/node` package.
+
+    Cookie.fromRequest visitCookie request
+    -- Result Cookie.Decode.Error Int
+
+Missing or duplicate cookies, invalid percent-encoding, and rejected values
+return an [`Error`](Cookie.Decode#Error). The value is percent-decoded
+once before the configured decoder runs.
+-}
+fromRequest : Cookie security a -> HttpServer.Request -> Result Decode.Error a
+fromRequest (Cookie settings) request =
+    Decode.fromRequest (Decode.field settings.name settings.decoder Decode.succeed) request
+
+
+{-| Encode a value and append a `Set-Cookie` field to the response.
+
+Accepts and returns an [`HttpServer.Response.Response`](https://packages.gren-lang.org/package/gren-lang/node/version/6.2.1/module/HttpServer.Response#Response)
+from the `gren-lang/node` package.
+
+    response
+        |> Cookie.set visitCookie 42
+
+This function percent-encodes the encoded value so it's safe to transport.
+-}
+set : Cookie security a -> a -> Response.Response -> Response.Response
+set cookie value response =
+    Response.appendHeader "Set-Cookie" (toString cookie value) response
+
+
+{-| Clear a cookie by appending an empty value with `Max-Age=0` to the response.
+
+    response
+        |> Cookie.clear visitCookie
+
+This just sets the `Max-Age=0` for the cookie to send to the browser. This will
+clear the cookie immediately.
+-}
+clear : Cookie security a -> Response.Response -> Response.Response
+clear cookie =
+    Response.appendHeader "Set-Cookie" (clearString cookie)
+
+
+{-| Transform a `Cookie` into a `String`. This can be sent with a `Set-Cookie`
+header to the browser. For an easier way to do this, just use the [`set`](#set)
+function.
+
+    Cookie.toString visitCookie 42
+    -- "visits=42; Path=/"
+-}
+toString : Cookie security a -> a -> String
+toString ((Cookie settings) as cookie) value =
+    String.join "; "
+        [ serializeName cookie (Encode.encode settings.encoder value |> Url.percentEncode)
+        , serializeAttributes cookie
+        ]
+
+
+{-| Produce the `Set-Cookie` header string for clearing a cookie.
+
+Transform a `Cookie` into a `String`. This can be sent with a `Set-Cookie`
+header to the browser. For an easier way to do this, just use the 
+[`clear`](#clear) function.
+
+    Cookie.clearString visitCookie
+    -- "visits=; Path=/; Max-Age=0"
+-}
+clearString : Cookie security a -> String
+clearString cookie =
+    String.join "; "
+        [ serializeName cookie ""
+        , serializeAttributes (withMaxAge 0 cookie)
+        ]
+
+
+{-| Keep only the text before the first semicolon in a name, domain, or path.
+-}
+beforeSemicolon : String -> String
+beforeSemicolon value =
+    String.split ";" value
+        |> Array.first
+        |> Maybe.withDefault ""
+
+
+{-| Format the cookie name and an already encoded value as a name=value pair.
+-}
+serializeName : Cookie security a -> String -> String
+serializeName (Cookie settings) value =
+    serializePair settings.name value
+
+
+{-| Join a key and value with an equals sign, without encoding either.
+-}
+serializePair : String -> String -> String
+serializePair key value =
+    key ++ "=" ++ value
+
+
+{-| Join the present scope and settings in wire order.
+-}
+serializeAttributes : Cookie security a -> String
+serializeAttributes (Cookie settings) =
+    [ serializeDomain settings.domain
+    , serializePath settings.path
+    , serializeSecure settings.secure
+    , serializeHttpOnly settings.httpOnly
+    , serializeSameSite settings.sameSite
+    , serializeMaxAge settings.maxAge
+    ]
+        |> Array.keepIf (not << String.isEmpty)
+        |> String.join "; "
+
+
+{-| Format a Domain attribute, or omit it for host-only cookies.
+-}
+serializeDomain : Maybe String -> String
+serializeDomain domain =
+    when domain is
+        Nothing ->
+            ""
+
+        Just value ->
+            serializePair "Domain" value
+
+
+{-| Format the normalized Path attribute.
+-}
+serializePath : String -> String
+serializePath path =
+    serializePair "Path" path
+
+
+{-| Format the Secure attribute when enabled.
+-}
+serializeSecure : Bool -> String
+serializeSecure secure =
+    if secure then "Secure" else ""
+
+
+{-| Format the HttpOnly attribute when enabled.
+-}
+serializeHttpOnly : Bool -> String
+serializeHttpOnly httpOnly =
+    if httpOnly then "HttpOnly" else ""
+
+
+{-| Format a SameSite attribute when configured.
+-}
+serializeSameSite : Maybe SameSiteSetting -> String
+serializeSameSite sameSite =
+    when sameSite is
+        Nothing ->
+            ""
+
+        Just (Restricted Strict) ->
+            serializePair "SameSite" "Strict"
+
+        Just (Restricted Lax) ->
+            serializePair "SameSite" "Lax"
+
+        Just Unrestricted ->
+            serializePair "SameSite" "None"
+
+
+{-| Format a Max-Age attribute, or omit it for session cookies.
+-}
+serializeMaxAge : Maybe Int -> String
+serializeMaxAge maxAge =
+    when maxAge is
+        Nothing ->
+            ""
+
+        Just seconds ->
+            serializePair "Max-Age" (String.fromInt seconds)
